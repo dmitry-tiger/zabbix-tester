@@ -1,4 +1,6 @@
 use AnyEvent::DBI::MySQL;
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use JSON;
 # get cached but not in use $dbh
 my $cv = AnyEvent->condvar;
 my $database='zabbix_proxy';
@@ -9,6 +11,7 @@ my $dbpassword='ZabbixPassw0rd';
 my @queue;
 my %timetable;
 my $limit_rows_from_db=100;
+my $max_send_pack_size=1000;
 my $timerange=60;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$hostname;port=$port;",$dbuser,$dbpassword);
 my $sel_countq = 'SELECT
@@ -45,14 +48,15 @@ $dbh->selectrow_hashref($sel_countq,{async=>0},sub {
             foreach my $key (keys %{$hash_ref}){
                 push @{$timetable{time()+$tshift}},{itemid=>$hash_ref->{$key}->{itemid},
                                                     key=>$hash_ref->{$key}->{key_},delay=>$hash_ref->{$key}->{delay},
-                                                    itype=>$hash_ref->{$key}->{itype},value_type=>$hash_ref->{$key}->{value_type}};
+                                                    itype=>$hash_ref->{$key}->{itype},value_type=>$hash_ref->{$key}->{value_type},
+                                                    host=>$hash_ref->{$key}->{host}};
                 $tshift++;
             }
             });
         };
     });
 
-my $t = AnyEvent->timer (
+my $value_generator = AnyEvent->timer (
     after => 0,
     interval => 1,
     cb => sub {
@@ -60,13 +64,68 @@ my $t = AnyEvent->timer (
         if (exists $timetable{$ctime}) {
             print "exists on ",$ctime,"\n";
             foreach my $kk (@{$timetable{$ctime}}){
-               print $kk->{itemid}."\n";
+                my $val = 0;
+                if ($kk->{value_type}==0) {
+                    #Numeric float
+                    $val = rand(1000);
+                }
+                elsif ($kk->{value_type}==1){
+                    #Character
+                    my @chars = ( "A" .. "Z", "a" .. "z", 0 .. 9, " ");
+                    $val = join("", @chars[ map { rand @chars } ( 1 .. 12 ) ]);
+                }
+                elsif ($kk->{value_type}==2){
+                    #Log
+                    my @chars = ( "A" .. "Z", "a" .. "z", 0 .. 9, " ");
+                    $val = join("", @chars[ map { rand @chars } ( 1 .. 50 ) ]);
+                }
+                elsif ($kk->{value_type}==3){
+                    #Numeric (insigned)
+                    $val = int(rand(1000));
+                }
+                elsif ($kk->{value_type}==4){
+                    #Text
+                    my @chars = ( "A" .. "Z", "a" .. "z", 0 .. 9, " ");
+                    $val = join("", @chars[ map { rand @chars } ( 1 .. 100 ) ]);
+                }
+                my ($clock,$ns)=gettimeofday();
+                push @queue,{host=>$kk->{host},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
             }
         }
-        
-        #print time(),"\n";
     });
-        
+
+my $value_sender = AnyEvent->timer (
+    after => 0,
+    interval => 5,
+    cb => sub {
+        my $pack_size = 0;
+        my @pack = ();
+        while (@queue) {
+            last if ++$pack_size > $max_send_pack_size;
+            my $item = shift @queue;
+            push @pack,$item;
+        }
+        my $json = JSON->new();
+        my $data = {
+        'request' => 'history data',
+        'host' => 'proxmox_proxy',
+        'data'    => \@pack,
+        };
+        my $json_data = $json->encode($data);
+        use bytes;
+        my $length = length($json_data);
+        no bytes;
+        my $output = pack(
+            "a4 b c4 c4 a*",
+            "ZBXD", 0x01,
+            ( $length & 0xFF ),
+            ( $length & 0x00FF ) >> 8,
+            ( $length & 0x0000FF ) >> 16,
+            ( $length & 0x000000FF ) >> 24,
+            0x00, 0x00, 0x00, 0x00, $json_data
+        );
+#        print $output;
+    });
         
         
         

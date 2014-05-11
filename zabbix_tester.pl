@@ -1,19 +1,22 @@
 use AnyEvent::DBI::MySQL;
+use AnyEvent::Socket;
 use Time::HiRes qw(usleep gettimeofday tv_interval);
 use JSON;
 # get cached but not in use $dbh
 my $cv = AnyEvent->condvar;
 my $database='zabbix_proxy';
-my $hostname='192.168.0.4';
-my $port='3306';
+my $dbhostname='192.168.0.4';
+my $dbport='3306';
 my $dbuser='zabbixtester';
 my $dbpassword='ZabbixPassw0rd';
+my $zserverhost= '192.168.0.191';
+my $zserverport= '10052';
 my @queue;
 my %timetable;
 my $limit_rows_from_db=100;
 my $max_send_pack_size=1000;
 my $timerange=60;
-my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$hostname;port=$port;",$dbuser,$dbpassword);
+my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;port=$dbport;",$dbuser,$dbpassword);
 my $sel_countq = 'SELECT
         count(*) as count
         FROM
@@ -115,7 +118,7 @@ my $value_sender = AnyEvent->timer (
         use bytes;
         my $length = length($json_data);
         no bytes;
-        my $output = pack(
+        my $out_data = pack(
             "a4 b c4 c4 a*",
             "ZBXD", 0x01,
             ( $length & 0xFF ),
@@ -125,8 +128,52 @@ my $value_sender = AnyEvent->timer (
             0x00, 0x00, 0x00, 0x00, $json_data
         );
 #        print $output;
+
+
+        tcp_connect $zserverhost, $zserverport,
+        sub {
+           my ($fh) = @_
+              or die "unable to connect: $!";
+  
+           my $handle; # avoid direct assignment so on_eof has it in scope.
+           $handle = new AnyEvent::Handle
+              fh     => $fh,
+              on_error => sub {
+                 AE::log error => $_[2];
+                 $_[0]->destroy;
+              },
+              on_eof => sub {
+                 $handle->destroy; # destroy handle
+                 AE::log info => "Done.";
+              };
+  
+           $handle->push_write ($out_data);
+  
+           $handle->push_read (line => "\015\012\015\012", sub {
+              my ($handle, $line) = @_;
+  
+              # print response header
+              print "HEADER\n$line\n\nBODY\n";
+  
+              $handle->on_read (sub {
+                 # print response body
+                 print $_[0]->rbuf;
+                 $_[0]->rbuf = "";
+              });
+           });
+        }, sub {
+           my ($fh) = @_;
+           # could call $fh->bind etc. here
+  
+           15
+        };
+
+
     });
         
-        
+    
+    
+    
+      
         
 $cv->recv;

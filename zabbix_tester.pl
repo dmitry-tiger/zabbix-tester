@@ -5,12 +5,12 @@ use JSON;
 # get cached but not in use $dbh
 my $cv = AnyEvent->condvar;
 my $database='zabbix_proxy';
-my $dbhostname='192.168.0.4';
+my $dbhostname='192.168.0.192';
 my $dbport='3306';
 my $dbuser='zabbixtester';
 my $dbpassword='ZabbixPassw0rd';
-my $zserverhost= '192.168.0.191';
-my $zserverport= '10052';
+my $zserverhost= "";
+my $zserverport= '10051';
 my @queue;
 my %timetable;
 my $limit_rows_from_db=100;
@@ -147,25 +147,26 @@ my $value_sender = AnyEvent->timer (
                  AE::log info => "Done.";
               };
   
-           $handle->push_write ($out_data);
-  
-           $handle->push_read (line => "\015\012\015\012", sub {
-              my ($handle, $line) = @_;
-  
-              # print response header
-              print "HEADER\n$line\n\nBODY\n";
-  
-              $handle->on_read (sub {
-                 # print response body
-                 print $_[0]->rbuf;
-                 $_[0]->rbuf = "";
-              });
-           });
+           #$handle->push_write ($out_data);
+           #
+           #$handle->push_read (line => "\015\012\015\012", sub {
+           #   my ($handle, $line) = @_;
+           #
+           #   # print response header
+           #   print "HEADER\n$line\n\nBODY\n";
+           #
+           #   $handle->on_read (sub {
+           #      # print response body
+           #      print $_[0]->rbuf;
+           #      $_[0]->rbuf = "";
+           #   });
+           #});
         }, sub {
            my ($fh) = @_;
            # could call $fh->bind etc. here
+#           setsockopt($fh, SOL_SOCKET, SO_REUSEADDR, 1)  or die $!;
   
-           15
+           2
         };
 
 

@@ -4,7 +4,7 @@ use AnyEvent::Handle;
 use Time::HiRes qw(usleep gettimeofday tv_interval);
 use JSON;
 
-my (@queue,$item_sent_counter,%timetable);
+my (@queue,$item_sent_counter,%timetable,%globalmacro,%hostmacro);
 my $database             = 'zabbix_proxy';
 my $dbhostname           = '192.168.0.192';
 my $dbport               = '3306';
@@ -16,11 +16,32 @@ my $delay_multiplyer     = 0.1;   # Multiplyer value for item delay
 my $limit_rows_from_db   = 300;   # Limit of rows for a query
 my $max_send_pack_size   = 1000;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
-my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows) 
+my $async_mysql_queries  = 0;     # Enable asynq queries in mysql (doesn't work in windows) 
 
 my $cv = AnyEvent->condvar;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;
                                         port=$dbport;",$dbuser,$dbpassword);
+
+my $sel_globalmacro = 'SELECT macro,value from globalmacro';     
+
+# Get all global macro synchoniosly (need get macro before items)
+$dbh->selectall_arrayref($sel_globalmacro,{async => 0},sub {
+    my ($array_ref) = @_;
+    for my $arr_item (@$array_ref){
+        $globalmacro{$arr_item->[0]}=$arr_item->[1];
+    }
+});
+
+my $sel_hostmacro = 'SELECT hostid,macro,value from hostmacro';     
+
+# Get all host macro synchoniosly (need get macro before itema)
+$dbh->selectall_arrayref($sel_hostmacro,{async => 0},sub {
+    my ($array_ref) = @_;
+    for my $arr_item (@$array_ref){
+        $hostmacro{$arr_item->[0]}{$arr_item->[1]}=$arr_item->[2];
+    }
+});
+
 my $sel_countq = '
     SELECT count(*) AS COUNT
     FROM items ,
@@ -28,7 +49,7 @@ my $sel_countq = '
     WHERE `hosts`.`status` = 0
       AND `items`.`status` = 0
       AND items.hostid = `hosts`.hostid';
-
+    
 # Get number of items (needed for limiting row number)     
 $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
     my ($hash_ref) = @_;
@@ -43,13 +64,18 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
                    items.status AS istatus,
                    items.value_type AS value_type,
                    `hosts`.`status`,
-                   `hosts`.`host` AS HOST
+                   `hosts`.`host` AS HOST,
+                   `hosts`.`name` AS host_name,
+                   `hosts`.`hostid` AS hostid,
+                   interface.ip AS intip
             FROM items ,
-                 `hosts`
+                 `hosts`,
+                 interface
             WHERE `items`.`status` = 0
               AND `hosts`.`status` = 0
               AND items.hostid = `hosts`.hostid
-            LIMIT'.$i*$limit_rows_from_db.','.$limit_rows_from_db;
+              AND interface.interfaceid = items.interfaceid
+            LIMIT '.$i*$limit_rows_from_db.','.$limit_rows_from_db;
             
         #Get items from database
         $dbh->selectall_hashref($sel_items, 'itemid', {async => $async_mysql_queries}, sub {
@@ -58,6 +84,30 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
             
             # Fill timetable with items
             foreach my $key (keys %{$hash_ref}){
+                # Replace internal zabbix macro
+                $hash_ref->{$key}->{key_} =~ s/{HOST\.CONN\d?}/\Q$hash_ref->{$key}->{intip}/g;
+                $hash_ref->{$key}->{key_} =~ s/{HOST\.HOST\d?}/\Q$hash_ref->{$key}->{host}/g;
+                $hash_ref->{$key}->{key_} =~ s/{HOST\.NAME\d?}/\Q$hash_ref->{$key}->{host_name}/g;
+                                  
+                # Replace all macro in item
+                if ($hash_ref->{$key}->{key_}=~/\{\$/) {                    
+                    # Get all macro in array
+                    my @a = $hash_ref->{$key}->{key_} =~ /(\{\$[^\}]+\})/g;
+                    
+                    # Check and replace macro
+                    for my $macro (@a){
+                        # Check if host contains hostmacro
+                        if (exists $hostmacro{$hash_ref->{$key}->{hostid}}{$macro}) {
+                            $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$hash_ref->{$key}->{hostid}}{$macro}/g;
+                        }
+                        
+                        # Check if host contains globalmacro
+                        if (exists $globalmacro{$macro}) {
+                            $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$globalmacro{$macro}/g;
+                        }
+                    }
+                }
+                
                 push @{$timetable{time() + $tshift}}, {
                                         itemid     => $hash_ref->{$key}->{itemid},
                                         key        => $hash_ref->{$key}->{key_},
@@ -209,7 +259,7 @@ my $value_sender = AnyEvent->timer(
                         my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
                         print "Warn.... Sending failed\n" if $json->{response} eq "failed";
                         print "processed $processed_items, failed $failed_items\n";
-                        $item_sent_counter+=$total_items;
+                        $item_sent_counter += $total_items;
                     });
                 });
               });  
@@ -230,6 +280,7 @@ my $stat_processing = AnyEvent->timer (
     interval => 60,
     cb       => sub {
        print "processed $item_sent_counter in 1 minute, average speed ".($item_sent_counter/60)." values per second\n";
+       print "Current send queue size".($#queue+1)."\n";
        $item_sent_counter = 0;
     });
     

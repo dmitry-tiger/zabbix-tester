@@ -14,7 +14,7 @@ my $dbpassword           = 'ZabbixPassw0rd';
 my $zserverhost          = "192.168.0.191";
 my $zserverport          = '10051';
 my $delay_multiplyer     = 1;   # Multiplyer value for item delay
-my $limit_rows_from_db   = 300;   # Limit of rows for a query
+my $limit_rows_from_db   = 30000;   # Limit of rows for a query
 my $max_send_pack_size   = 1000;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
 my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
@@ -64,9 +64,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
         if ($i > int($hash_ref->{count} / $limit_rows_from_db)) {
             return;
         }
-        do(sub {
-
-            my $sel_items='
+        my $sel_items='
             SELECT  items.interfaceid,
                     items.itemid AS itemid,
                     items.key_ AS key_,
@@ -88,7 +86,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
                     AND `hosts`.`status` = 0
                     AND `items`.flags  = 0
             LIMIT '.$i*$limit_rows_from_db.','.$limit_rows_from_db;
-                
+            $i++;
             #Get items from database
             $dbh->selectall_hashref($sel_items, 'itemid', {async => $async_mysql_queries}, sub {
                 my ($hash_ref) = @_;
@@ -133,13 +131,12 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
                     
                     $tshift < $timerange ? $tshift++ : ( $tshift = 0 );
                 }
-                print "timetable 1 pass done\n";
-            });
+                print "timetable 1 pass done\n".scalar (keys %timetable)." events created\n";
             $loop->();
 	});
 
         print "Filling timetable done\n"; 
-    };$loop->();
+    };$loop->() for 1 .. $num_concurent_mysql_threads;
     weaken($loop);
 });
 
@@ -151,7 +148,7 @@ my $value_generator = AnyEvent->timer(
         my $ctime = time();
         
         if (exists $timetable{$ctime}) {
-            #print "exists on ",$ctime,"\n";
+            print scalar @{$timetable{$ctime}}." values exists on ",$ctime,"\n";
             foreach my $kk (@{$timetable{$ctime}}){
                 my $val = 0;
                 
@@ -184,6 +181,10 @@ my $value_generator = AnyEvent->timer(
                 
                 # Add item to send queue
                 push @queue,{host=>$kk->{hosthost},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
+#                print "queue length ".scalar @queue."\n";
+                
+                # Change delay 0 to 60 on trapper items
+                $kk->{delay} = 60 if $kk->{delay}==0;
                 
                 # Readd item to timetable
                 push @{$timetable{$ctime+int($kk->{delay}*$delay_multiplyer)}},$kk;
@@ -197,7 +198,7 @@ my $value_generator = AnyEvent->timer(
 # Timer for send items from send queue to zabbix server
 my $value_sender = AnyEvent->timer(
     after    => 5,
-    interval => 5,
+    interval => 2,
     cb       => sub {
         my $pack_size = 0;
         my @pack = ();
@@ -291,7 +292,7 @@ my $value_sender = AnyEvent->timer(
             # could call $fh->bind etc. here
             #setsockopt($fh, SOL_SOCKET, SO_REUSEADDR, 1)  or die $!;
             
-            5  #set timeout
+            15  #set timeout
         };
     });   
 
@@ -305,11 +306,11 @@ my $stat_processing = AnyEvent->timer (
        $item_sent_counter = 0;
     });
     
-    my $end = AnyEvent->timer (
-    after    => 20,
-    interval => 10,
-    cb       => sub {
-       print "Exiting \n";
-       exit 0;
-    });
+    #my $end = AnyEvent->timer (
+    #after    => 20,
+    #interval => 10,
+    #cb       => sub {
+    #   print "Exiting \n";
+    #   exit 0;
+    #});
 $cv->recv;

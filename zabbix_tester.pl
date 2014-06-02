@@ -1,6 +1,7 @@
 use AnyEvent::DBI::MySQL;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
+use Scalar::Util qw(weaken);
 use Time::HiRes qw(usleep gettimeofday tv_interval);
 use JSON;
 
@@ -12,11 +13,12 @@ my $dbuser               = 'zabbixtester';
 my $dbpassword           = 'ZabbixPassw0rd';
 my $zserverhost          = "192.168.0.191";
 my $zserverport          = '10051';
-my $delay_multiplyer     = 0.1;   # Multiplyer value for item delay
+my $delay_multiplyer     = 1;   # Multiplyer value for item delay
 my $limit_rows_from_db   = 300;   # Limit of rows for a query
 my $max_send_pack_size   = 1000;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
-my $async_mysql_queries  = 0;     # Enable asynq queries in mysql (doesn't work in windows) 
+my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
+my $num_concurent_mysql_threads = 3; # Number of concurent mysql threads
 
 my $cv = AnyEvent->condvar;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;
@@ -55,71 +57,90 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
     my ($hash_ref) = @_;
     
     # Separate queries for get limited row number
-    for my $i (0 .. int($hash_ref->{count} / $limit_rows_from_db)){
-        my $sel_items='
-            SELECT items.itemid AS itemid,
-                   items.key_ AS key_,
-                   items.delay AS delay,
-                   items.type AS itype,
-                   items.status AS istatus,
-                   items.value_type AS value_type,
-                   `hosts`.`status`,
-                   `hosts`.`host` AS HOST,
-                   `hosts`.`name` AS host_name,
-                   `hosts`.`hostid` AS hostid,
-                   interface.ip AS intip
-            FROM items ,
-                 `hosts`,
-                 interface
-            WHERE `items`.`status` = 0
-              AND `hosts`.`status` = 0
-              AND items.hostid = `hosts`.hostid
-              AND interface.interfaceid = items.interfaceid
+    
+#    for my $i (0 .. int($hash_ref->{count} / $limit_rows_from_db)){
+    my $i = 0;
+    my $loop;$loop = sub {
+        if ($i > int($hash_ref->{count} / $limit_rows_from_db)) {
+            return;
+        }
+        do(sub {
+
+            my $sel_items='
+            SELECT  items.interfaceid,
+                    items.itemid AS itemid,
+                    items.key_ AS key_,
+                    items.delay AS delay,
+                    items.type AS itype,
+                    items.status AS istatus,
+                    items.value_type AS value_type,
+                    `hosts`.`status` AS hstatus,
+                    `hosts`.`host` AS hosthost,
+                    `hosts`.`name` AS host_name,
+                    `hosts`.`hostid` AS hostid,
+                    interface.ip AS intip
+            FROM items
+            JOIN `hosts`
+            ON `hosts`.hostid = items.hostid
+            LEFT JOIN interface
+            ON  items.interfaceid = interface.interfaceid
+            WHERE  `items`.`status` = 0
+                    AND `hosts`.`status` = 0
+                    AND `items`.flags  = 0
             LIMIT '.$i*$limit_rows_from_db.','.$limit_rows_from_db;
-            
-        #Get items from database
-        $dbh->selectall_hashref($sel_items, 'itemid', {async => $async_mysql_queries}, sub {
-            my ($hash_ref) = @_;
-            my $tshift=0;
-            
-            # Fill timetable with items
-            foreach my $key (keys %{$hash_ref}){
-                # Replace internal zabbix macro
-                $hash_ref->{$key}->{key_} =~ s/{HOST\.CONN\d?}/\Q$hash_ref->{$key}->{intip}/g;
-                $hash_ref->{$key}->{key_} =~ s/{HOST\.HOST\d?}/\Q$hash_ref->{$key}->{host}/g;
-                $hash_ref->{$key}->{key_} =~ s/{HOST\.NAME\d?}/\Q$hash_ref->{$key}->{host_name}/g;
-                                  
-                # Replace all macro in item
-                if ($hash_ref->{$key}->{key_}=~/\{\$/) {                    
-                    # Get all macro in array
-                    my @a = $hash_ref->{$key}->{key_} =~ /(\{\$[^\}]+\})/g;
-                    
-                    # Check and replace macro
-                    for my $macro (@a){
-                        # Check if host contains hostmacro
-                        if (exists $hostmacro{$hash_ref->{$key}->{hostid}}{$macro}) {
-                            $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$hash_ref->{$key}->{hostid}}{$macro}/g;
-                        }
+                
+            #Get items from database
+            $dbh->selectall_hashref($sel_items, 'itemid', {async => $async_mysql_queries}, sub {
+                my ($hash_ref) = @_;
+                print "SQLdone\n";
+                my $tshift=0;
+                
+                # Fill timetable with items
+                foreach my $key (keys %{$hash_ref}){
+                    # Replace internal zabbix macro
+                    $hash_ref->{$key}->{key_} =~ s/{HOST\.CONN\d?}/\Q$hash_ref->{$key}->{intip}/g;
+                    $hash_ref->{$key}->{key_} =~ s/{HOST\.HOST\d?}/\Q$hash_ref->{$key}->{hosthost}/g;
+                    $hash_ref->{$key}->{key_} =~ s/{HOST\.NAME\d?}/\Q$hash_ref->{$key}->{host_name}/g;
+                                      
+                    # Replace all macro in item
+                    if ($hash_ref->{$key}->{key_}=~/\{\$/) {                    
+                        # Get all macro in array
+                        my @a = $hash_ref->{$key}->{key_} =~ /(\{\$[^\}]+\})/g;
                         
-                        # Check if host contains globalmacro
-                        if (exists $globalmacro{$macro}) {
-                            $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$globalmacro{$macro}/g;
+                        # Check and replace macro
+                        for my $macro (@a){
+                            # Check if host contains hostmacro
+                            if (exists $hostmacro{$hash_ref->{$key}->{hostid}}{$macro}) {
+                                $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$hash_ref->{$key}->{hostid}}{$macro}/g;
+                            }
+                            
+                            # Check if host contains globalmacro
+                            if (exists $globalmacro{$macro}) {
+                                $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$globalmacro{$macro}/g;
+                            }
                         }
                     }
+                    
+                    push @{$timetable{time() + $tshift}}, {
+                                            itemid     => $hash_ref->{$key}->{itemid},
+                                            key        => $hash_ref->{$key}->{key_},
+                                            delay      => $hash_ref->{$key}->{delay},
+                                            itype      => $hash_ref->{$key}->{itype},
+                                            value_type => $hash_ref->{$key}->{value_type},
+                                            hosthost       => $hash_ref->{$key}->{hosthost}
+                                            };
+                    
+                    
+                    $tshift < $timerange ? $tshift++ : ( $tshift = 0 );
                 }
-                
-                push @{$timetable{time() + $tshift}}, {
-                                        itemid     => $hash_ref->{$key}->{itemid},
-                                        key        => $hash_ref->{$key}->{key_},
-                                        delay      => $hash_ref->{$key}->{delay},
-                                        itype      => $hash_ref->{$key}->{itype},
-                                        value_type => $hash_ref->{$key}->{value_type},
-                                        host       => $hash_ref->{$key}->{host}};
-                
-                $tshift < $timerange ? $tshift++ : ( $tshift = 0 );
-            }
-        });
-    };
+                print "timetable 1 pass done\n";
+            });
+            $loop->();
+	});
+
+        print "Filling timetable done\n"; 
+    };$loop->();
+    weaken($loop);
 });
 
 # Timer for check timetable jobs and generate item values
@@ -162,7 +183,7 @@ my $value_generator = AnyEvent->timer(
                 my ($clock,$ns)=gettimeofday();
                 
                 # Add item to send queue
-                push @queue,{host=>$kk->{host},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
+                push @queue,{host=>$kk->{hosthost},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
                 
                 # Readd item to timetable
                 push @{$timetable{$ctime+int($kk->{delay}*$delay_multiplyer)}},$kk;
@@ -280,8 +301,15 @@ my $stat_processing = AnyEvent->timer (
     interval => 60,
     cb       => sub {
        print "processed $item_sent_counter in 1 minute, average speed ".($item_sent_counter/60)." values per second\n";
-       print "Current send queue size".($#queue+1)."\n";
+       print "Current send queue size ".($#queue+1)."\n";
        $item_sent_counter = 0;
     });
     
+    my $end = AnyEvent->timer (
+    after    => 20,
+    interval => 10,
+    cb       => sub {
+       print "Exiting \n";
+       exit 0;
+    });
 $cv->recv;

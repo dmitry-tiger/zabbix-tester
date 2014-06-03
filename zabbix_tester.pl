@@ -1,3 +1,4 @@
+use AnyEvent;
 use AnyEvent::DBI::MySQL;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
@@ -13,8 +14,8 @@ my $dbuser               = 'zabbixtester';
 my $dbpassword           = 'ZabbixPassw0rd';
 my $zserverhost          = "192.168.0.191";
 my $zserverport          = '10051';
-my $delay_multiplyer     = 1;   # Multiplyer value for item delay
-my $limit_rows_from_db   = 30000;   # Limit of rows for a query
+my $delay_multiplyer     = 0.5;   # Multiplyer value for item delay
+my $limit_rows_from_db   = 3000;   # Limit of rows for a query
 my $max_send_pack_size   = 1000;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
 my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
@@ -313,4 +314,12 @@ my $stat_processing = AnyEvent->timer (
     #   print "Exiting \n";
     #   exit 0;
     #});
+    
+# signal handlers take function name
+# instead of being references to functions
+sub unloop { $cv->send; }
+$SIG{INT} = 'unloop';
+    
+# start waiting in event loop    
 $cv->recv;
+print "Done";

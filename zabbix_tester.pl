@@ -15,8 +15,8 @@ my $dbpassword           = 'ZabbixPassw0rd';
 my $zserverhost          = "192.168.0.191";
 my $zserverport          = '10051';
 my $delay_multiplyer     = 0.5;   # Multiplyer value for item delay
-my $limit_rows_from_db   = 3000;   # Limit of rows for a query
-my $max_send_pack_size   = 1000;  # Max values send in one network session
+my $limit_rows_from_db   = 300;   # Limit of rows for a query
+my $max_send_pack_size   = 200;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
 my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
 my $num_concurent_mysql_threads = 3; # Number of concurent mysql threads
@@ -138,7 +138,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
 
         print "Filling timetable done\n"; 
     };$loop->() for 1 .. $num_concurent_mysql_threads;
-    weaken($loop);
+#    weaken($loop);
 });
 
 # Timer for check timetable jobs and generate item values
@@ -197,105 +197,105 @@ my $value_generator = AnyEvent->timer(
     });
 
 # Timer for send items from send queue to zabbix server
-my $value_sender = AnyEvent->timer(
-    after    => 5,
-    interval => 2,
-    cb       => sub {
-        my $pack_size = 0;
-        my @pack = ();
-        
-        # Walk for queue
-        while (@queue) {
-            #Check if pack size less than maximum defined size
-            last if ++$pack_size > $max_send_pack_size;
-            my $item = shift @queue;
-            
-            # Add item to send pack
-            push @pack,$item;
-        }
-        my $json = JSON->new();
-        
-        #Prepare data for sending to zabbix server
-        my $data = {
-        'request' => 'history data',
-        'host'    => 'test-proxy',
-        'data'    => \@pack,
-        'clock'   => time
-        };
-        my $json_data = $json->encode($data);
- 
-        # Get length of data in bytes
-        use bytes;
-        my $length = length($json_data);
-        no bytes;
-        #my $out_data = pack(
-        #    "a4 b c4 c4 a*",
-        #    "ZBXD", 0x01,
-        #    ( $length & 0xFF ),
-        #    ( $length & 0x00FF ) >> 8,
-        #    ( $length & 0x0000FF ) >> 16,
-        #    ( $length & 0x000000FF ) >> 24,
-        #    0x00, 0x00, 0x00, 0x00, $json_data
-        #);
-        
-        # Pack data into zabbix protocol
-        my $out_data = pack(
-            "a4 b Q a*",
-            "ZBXD", 0x01, $length, $json_data
-        );
-        
-        # Create connection to zabbix server
-        tcp_connect $zserverhost, $zserverport,
-        sub {
-            my ($fh) = @_
-                or die "unable to connect: $!";
-  
-            my $handle; 
-            $handle = new AnyEvent::Handle
-                fh     => $fh,
-                on_error => sub {
-                AE::log error => $_[2];
-                $_[0]->destroy;
-            },
-            on_eof => sub {
-                $handle->destroy; # destroy handle
-                AE::log info => "Done.";
-            };
-            
-            # Send data to server
-            $handle->push_write ($out_data);
-            
-            # Read answer (first 5 bytes for check ZBXD header)
-            $handle->push_read (chunk => 5,  sub {
-                my ($response,$d)=unpack ("A4C",$_[1]);
-                print "Warn.... Invalid response from Server: \"$response\"\n" if $response ne "ZBXD";
-                
-                $handle->on_read (sub {
-                # Get length of answer data    
-                shift->unshift_read (chunk => 8, sub {
-                    my $len = unpack "Q", $_[1];
-                    #print "Length is: $len - unpacked, ".$_[1]."-packed\n";
-                    
-                    # Get answer data
-                    shift->unshift_read (chunk => $len, sub {
-                        my $json = decode_json($_[1]);
-                        my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
-                        print "Warn.... Sending failed\n" if $json->{response} eq "failed";
-                        print "processed $processed_items, failed $failed_items\n";
-                        $item_sent_counter += $total_items;
-                    });
-                });
-              });  
-           });
-           
-        }, sub {
-            my ($fh) = @_;
-            # could call $fh->bind etc. here
-            #setsockopt($fh, SOL_SOCKET, SO_REUSEADDR, 1)  or die $!;
-            
-            15  #set timeout
-        };
-    });   
+#my $value_sender = AnyEvent->timer(
+#    after    => 5,
+#    interval => 2,
+#    cb       => sub {
+#        my $pack_size = 0;
+#        my @pack = ();
+#        
+#        # Walk for queue
+#        while (@queue) {
+#            #Check if pack size less than maximum defined size
+#            last if ++$pack_size > $max_send_pack_size;
+#            my $item = shift @queue;
+#            
+#            # Add item to send pack
+#            push @pack,$item;
+#        }
+#        my $json = JSON->new();
+#        
+#        #Prepare data for sending to zabbix server
+#        my $data = {
+#        'request' => 'history data',
+#        'host'    => 'test-proxy',
+#        'data'    => \@pack,
+#        'clock'   => time
+#        };
+#        my $json_data = $json->encode($data);
+# 
+#        # Get length of data in bytes
+#        use bytes;
+#        my $length = length($json_data);
+#        no bytes;
+#        #my $out_data = pack(
+#        #    "a4 b c4 c4 a*",
+#        #    "ZBXD", 0x01,
+#        #    ( $length & 0xFF ),
+#        #    ( $length & 0x00FF ) >> 8,
+#        #    ( $length & 0x0000FF ) >> 16,
+#        #    ( $length & 0x000000FF ) >> 24,
+#        #    0x00, 0x00, 0x00, 0x00, $json_data
+#        #);
+#        
+#        # Pack data into zabbix protocol
+#        my $out_data = pack(
+#            "a4 b Q a*",
+#            "ZBXD", 0x01, $length, $json_data
+#        );
+#        
+#        # Create connection to zabbix server
+#        tcp_connect $zserverhost, $zserverport,
+#        sub {
+#            my ($fh) = @_
+#                or die "unable to connect: $!";
+#  
+#            my $handle; 
+#            $handle = new AnyEvent::Handle
+#                fh     => $fh,
+#                on_error => sub {
+#                AE::log error => $_[2];
+#                $_[0]->destroy;
+#            },
+#            on_eof => sub {
+#                $handle->destroy; # destroy handle
+#                AE::log info => "Done.";
+#            };
+#            
+#            # Send data to server
+#            $handle->push_write ($out_data);
+#            
+#            # Read answer (first 5 bytes for check ZBXD header)
+#            $handle->push_read (chunk => 5,  sub {
+#                my ($response,$d)=unpack ("A4C",$_[1]);
+#                print "Warn.... Invalid response from Server: \"$response\"\n" if $response ne "ZBXD";
+#                
+#                $handle->on_read (sub {
+#                # Get length of answer data    
+#                shift->unshift_read (chunk => 8, sub {
+#                    my $len = unpack "Q", $_[1];
+#                    #print "Length is: $len - unpacked, ".$_[1]."-packed\n";
+#                    
+#                    # Get answer data
+#                    shift->unshift_read (chunk => $len, sub {
+#                        my $json = decode_json($_[1]);
+#                        my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
+#                        print "Warn.... Sending failed\n" if $json->{response} eq "failed";
+#                        print "processed $processed_items, failed $failed_items\n";
+#                        $item_sent_counter += $total_items;
+#                    });
+#                });
+#              });  
+#           });
+#           
+#        }, sub {
+#            my ($fh) = @_;
+#            # could call $fh->bind etc. here
+#            #setsockopt($fh, SOL_SOCKET, SO_REUSEADDR, 1)  or die $!;
+#            
+#            15  #set timeout
+#        };
+#    });   
 
 # Timer for calculate statistic    
 my $stat_processing = AnyEvent->timer (
@@ -314,6 +314,114 @@ my $stat_processing = AnyEvent->timer (
     #   print "Exiting \n";
     #   exit 0;
     #});
+    
+    
+my $sender;$sender = sub {
+        my $start = AE::now();
+ 
+        tcp_connect($zserverhost, $zserverport ,sub {
+                my ($fh) = @_
+                or die "unable to connect: $!";
+               
+                print "thread started on ".AE::now()."\n";
+                my $wait = $start + 5 - AE::now();
+                return $sender->() if $wait < 0;
+#                do {return $sender->()} if $#queue < 1000;
+                my $handle;
+                $handle = new AnyEvent::Handle
+                    fh     => $fh,
+                    on_error => sub {
+                    AE::log error => $_[2];
+                    $_[0]->destroy;
+                },
+                on_eof => sub {
+                    $handle->destroy; # destroy handle
+                    AE::log info => "Done.";
+                };
+                my $pack_size = 0;
+                my @pack = ();
+               
+                # Walk for queue
+                while (@queue) {
+                    #Check if pack size less than maximum defined size
+                    last if ++$pack_size > $max_send_pack_size;
+                    my $item = shift @queue;
+                   
+                    # Add item to send pack
+                    push @pack,$item;
+                }
+                my $json = JSON->new();
+               
+                #Prepare data for sending to zabbix server
+                my $data = {
+                'request' => 'history data',
+                'host'    => 'test-proxy',
+                'data'    => \@pack,
+                'clock'   => time
+                };
+                my $json_data = $json->encode($data);
+               
+                # Get length of data in bytes
+                use bytes;
+                my $length = length($json_data);
+                no bytes;
+                #my $out_data = pack(
+                #    "a4 b c4 c4 a*",
+                #    "ZBXD", 0x01,
+                #    ( $length & 0xFF ),
+                #    ( $length & 0x00FF ) >> 8,
+                #    ( $length & 0x0000FF ) >> 16,
+                #    ( $length & 0x000000FF ) >> 24,
+                #    0x00, 0x00, 0x00, 0x00, $json_data
+                #);
+               
+                # Pack data into zabbix protocol
+                my $out_data = pack(
+                    "a4 b Q a*",
+                    "ZBXD", 0x01, $length, $json_data
+                );
+ 
+                $handle->push_write ($out_data);
+               
+                $handle->push_read (chunk => 5,  sub {
+                        my ($response,$d)=unpack ("A4C",$_[1]);
+                        print "Warn.... Invalid response from Server: \"$response\"\n" if $response ne "ZBXD";
+                       
+                        $handle->on_read (sub {
+                                # Get length of answer data    
+                                shift->unshift_read (chunk => 8, sub {
+                                    my $len = unpack "Q", $_[1];
+                                    #print "Length is: $len - unpacked, ".$_[1]."-packed\n";
+                                   
+                                    # Get answer data
+                                    shift->unshift_read (chunk => $len, sub {
+                                        my $json = decode_json($_[1]);
+                                        my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
+                                        print "Warn.... Sending failed\n" if $json->{response} eq "failed";
+                                        print "processed $processed_items, failed $failed_items\n";
+                                        $item_sent_counter += $total_items;
+                                    });
+                                });
+                        });  
+                });
+               
+               
+               
+               
+               
+               
+#               $sender->() if $#queue > 3000;
+ 
+                my $t;$t = AE::timer $wait,0, sub {
+                        undef $t;
+                        $sender->();
+                };
+        }, sub { 5 })
+};$sender->() for 1..3;
+weaken($sender);    
+    
+    
+    
     
 # signal handlers take function name
 # instead of being references to functions

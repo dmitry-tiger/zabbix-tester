@@ -25,7 +25,7 @@ my $cv = AnyEvent->condvar;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;
                                         port=$dbport;",$dbuser,$dbpassword);
 
-my $sel_globalmacro = 'SELECT macro,value from globalmacro';     
+my $sel_globalmacro = 'SELECT macro,value from globalmacro';
 
 # Get all global macro synchoniosly (need get macro before items)
 $dbh->selectall_arrayref($sel_globalmacro,{async => 0},sub {
@@ -138,7 +138,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
 
         print "Filling timetable done\n"; 
     };$loop->() for 1 .. $num_concurent_mysql_threads;
-#    weaken($loop);
+    weaken($loop);
 });
 
 # Timer for check timetable jobs and generate item values

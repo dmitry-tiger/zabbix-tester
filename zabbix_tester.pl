@@ -5,21 +5,32 @@ use AnyEvent::Handle;
 use Scalar::Util qw(weaken);
 use Time::HiRes qw(usleep gettimeofday tv_interval);
 use JSON;
+use AnyEvent::Run;
+use AnyEvent::Monitor::CPU qw( monitor_cpu );
 
-my (@queue,$item_sent_counter,%timetable,%globalmacro,%hostmacro);
-my $database             = 'zabbix_proxy';
-my $dbhostname           = '192.168.0.192';
+my (@queue,$item_sent_counter,$proxy_id,%timetable,%globalmacro,%hostmacro);
+my $proxy_name           = '';
+my $database             = 'zabbix';
+my $dbhostname           = '';
 my $dbport               = '3306';
-my $dbuser               = 'zabbixtester';
-my $dbpassword           = 'ZabbixPassw0rd';
-my $zserverhost          = "192.168.0.191";
+my $dbuser               = 'zabbix';
+my $dbpassword           = '';
+my $zserverhost          = "";
 my $zserverport          = '10051';
-my $delay_multiplyer     = 0.5;   # Multiplyer value for item delay
-my $limit_rows_from_db   = 300;   # Limit of rows for a query
-my $max_send_pack_size   = 200;  # Max values send in one network session
+my $stat_server_host     = '';
+my $stat_server_port     = '10052';
+my $stat_server_stathost = '';
+my $work_with_server     = 1;
+my $delay_multiplyer     = 0.05;   # Multiplyer value for item delay
+my $limit_rows_from_db   = 5000;   # Limit of rows for a query
+my $max_send_pack_size   = 1000;  # Max values send in one network session
 my $timerange            = 60;    # Period for spreading values in first timetable generation
 my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
 my $num_concurent_mysql_threads = 3; # Number of concurent mysql threads
+my $num_history_sender_threads = 20; # Number of concurent histry sender threads
+my $start_sending_delay  = 180; # Delay for starting send data
+
+my $monitor = monitor_cpu cb => sub {}, interval => 1;
 
 my $cv = AnyEvent->condvar;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;
@@ -45,13 +56,35 @@ $dbh->selectall_arrayref($sel_hostmacro,{async => 0},sub {
     }
 });
 
+if ($work_with_server) {
+    # Get proxy hostid id by proxy name 
+    my $sel_hostmacro = 'SELECT hostid FROM `hosts` WHERE `host` = \''.$proxy_name.'\' AND status = 5';     
+
+    $dbh->selectall_arrayref($sel_hostmacro,{async => 0},sub {
+        my ($array_ref) = @_;
+        if (scalar @$array_ref == 1) {
+            for my $arr_item (@$array_ref){
+                $proxy_id = $arr_item->[0];
+            }
+        }
+        else{
+            die ("Wrong proxy name");
+        }
+
+    }); 
+}
+
 my $sel_countq = '
     SELECT count(*) AS COUNT
     FROM items ,
          `hosts`
     WHERE `hosts`.`status` = 0
       AND `items`.`status` = 0
-      AND items.hostid = `hosts`.hostid';
+      AND items.hostid = `hosts`.hostid
+      AND `items`.flags  = 0';
+      
+# Add filer by proxyid if working with server database
+$sel_countq .= " AND `hosts`.proxy_hostid = '$proxy_id'" if $work_with_server;
     
 # Get number of items (needed for limiting row number)     
 $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
@@ -60,11 +93,17 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
     # Separate queries for get limited row number
     
 #    for my $i (0 .. int($hash_ref->{count} / $limit_rows_from_db)){
-    my $i = 0;
+    our $limit_iterator = 0;
     my $loop;$loop = sub {
-        if ($i > int($hash_ref->{count} / $limit_rows_from_db)) {
+        if ($limit_iterator > int($hash_ref->{COUNT} / $limit_rows_from_db)) {
             return;
         }
+
+        # Add filer by proxyid if working with server database
+        my $proxy_filter;
+        $work_with_server ? ($proxy_filter = " AND `hosts`.proxy_hostid = '$proxy_id'") : ($proxy_filter = "");
+        
+        print "Selecting with $limit_iterator\n";
         my $sel_items='
             SELECT  items.interfaceid,
                     items.itemid AS itemid,
@@ -85,14 +124,16 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
             ON  items.interfaceid = interface.interfaceid
             WHERE  `items`.`status` = 0
                     AND `hosts`.`status` = 0
-                    AND `items`.flags  = 0
-            LIMIT '.$i*$limit_rows_from_db.','.$limit_rows_from_db;
-            $i++;
+                    AND `items`.flags  = 0'.
+                    $proxy_filter         
+            .' LIMIT '.$limit_iterator*$limit_rows_from_db.','.$limit_rows_from_db;
+            $limit_iterator++;
             #Get items from database
             $dbh->selectall_hashref($sel_items, 'itemid', {async => $async_mysql_queries}, sub {
                 my ($hash_ref) = @_;
-                print "SQLdone\n";
-                my $tshift=0;
+#                print "SQLdone\n";
+                # Start after $tshift seconds
+                my $tshift=0; 
                 
                 # Fill timetable with items
                 foreach my $key (keys %{$hash_ref}){
@@ -110,7 +151,8 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
                         for my $macro (@a){
                             # Check if host contains hostmacro
                             if (exists $hostmacro{$hash_ref->{$key}->{hostid}}{$macro}) {
-                                $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$hash_ref->{$key}->{hostid}}{$macro}/g;
+                                # DEBUG print "replace $macro to ".$hostmacro{$hash_ref->{$key}->{hostid}}{$macro}."\n";
+                                $hash_ref->{$key}->{key_} =~ s/\Q$macro/\Q$hostmacro{$hash_ref->{$key}->{hostid}}{$macro}/g;
                             }
                             
                             # Check if host contains globalmacro
@@ -120,7 +162,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
                         }
                     }
                     
-                    push @{$timetable{time() + $tshift}}, {
+                    push @{$timetable{time() + $tshift + $start_sending_delay}}, {
                                             itemid     => $hash_ref->{$key}->{itemid},
                                             key        => $hash_ref->{$key}->{key_},
                                             delay      => $hash_ref->{$key}->{delay},
@@ -137,7 +179,8 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
 	});
 
         print "Filling timetable done\n"; 
-    };$loop->() for 1 .. $num_concurent_mysql_threads;
+#    };$loop->() for 1 .. $num_concurent_mysql_threads;
+    };$loop->();
     weaken($loop);
 });
 
@@ -179,6 +222,10 @@ my $value_generator = AnyEvent->timer(
                 
                 # Get timestamp and nanoseconds
                 my ($clock,$ns)=gettimeofday();
+                
+                if ($kk->{key} eq 'system.localtime'){
+                    $val = $clock;
+                }
                 
                 # Add item to send queue
                 push @queue,{host=>$kk->{hosthost},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
@@ -302,29 +349,59 @@ my $stat_processing = AnyEvent->timer (
     after    => 60,
     interval => 60,
     cb       => sub {
-       print "processed $item_sent_counter in 1 minute, average speed ".($item_sent_counter/60)." values per second\n";
-       print "Current send queue size ".($#queue+1)."\n";
-       $item_sent_counter = 0;
+        
+        my $handle = AnyEvent::Run->new(
+            cmd      => [ 'cat', "/proc/$$/statm" ],
+            on_eof => sub {
+                $_[0]->destroy;
+            },
+            on_error  => sub {
+                $_[0]->destroy;
+            },
+        );
+        
+        # Read line from /proc/$$/statm
+        $handle->push_read(line => sub {
+	    my ($hdl, $line) = @_;
+            
+            # Split stat for values (man 5 proc for value sequence)
+            my @proc_stat = split /\s+/,$line;
+            
+            
+            my $stats = $monitor->stats;
+            print "Processed $item_sent_counter in 1 minute, average speed ".($item_sent_counter/60)." values per second\n";
+            print "Current send queue size ".($#queue+1).", CPU usage $stats->{usage}, VmSize $proc_stat[0], VmRSS $proc_stat[1]\n";
+            my @stat_data = (
+                            {host => $stat_server_stathost, key => 'tester1.queue.size',     value => ($#queue+1)},
+                            {host => $stat_server_stathost, key => 'tester1.values.sent',    value => ($item_sent_counter/60)},
+                            {host => $stat_server_stathost, key => 'tester1.cpu.usage',      value => $stats->{usage}},
+                            {host => $stat_server_stathost, key => 'tester1.cpu.avg_usage',  value => ($stats->{usage_avg})},
+                            {host => $stat_server_stathost, key => 'tester1.stat.vsize',     value => $proc_stat[0]},
+                            {host => $stat_server_stathost, key => 'tester1.stat.rss',       value => $proc_stat[1]},    
+                            {host => $stat_server_stathost, key => 'tester1.stat.shared',    value => $proc_stat[2]},
+                            {host => $stat_server_stathost, key => 'tester1.stat.datastack', value => $proc_stat[5]}, 
+                            
+                            );
+            zabbix_sender($stat_server_host,$stat_server_port,\@stat_data);
+            $item_sent_counter = 0;
+            $monitor->reset_stats();
+            $handle->destroy;
+	});
     });
-    
-    #my $end = AnyEvent->timer (
-    #after    => 20,
-    #interval => 10,
-    #cb       => sub {
-    #   print "Exiting \n";
-    #   exit 0;
-    #});
-    
     
 my $sender;$sender = sub {
         my $start = AE::now();
  
         tcp_connect($zserverhost, $zserverport ,sub {
                 my ($fh) = @_
-                or die "unable to connect: $!";
+                or do {
+                    print "unable connect to zabbix server/proxy: $!\n";
+                    return $sender->();
+#                        die "unable to connect: $!";
+                        };
                
-                print "thread started on ".AE::now()."\n";
-                my $wait = $start + 5 - AE::now();
+#                print "thread started on ".AE::now()."\n";
+                my $wait = $start + 2 - AE::now();
                 return $sender->() if $wait < 0;
 #                do {return $sender->()} if $#queue < 1000;
                 my $handle;
@@ -355,7 +432,7 @@ my $sender;$sender = sub {
                 #Prepare data for sending to zabbix server
                 my $data = {
                 'request' => 'history data',
-                'host'    => 'test-proxy',
+                'host'    => $proxy_name,
                 'data'    => \@pack,
                 'clock'   => time
                 };
@@ -398,28 +475,88 @@ my $sender;$sender = sub {
                                         my $json = decode_json($_[1]);
                                         my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
                                         print "Warn.... Sending failed\n" if $json->{response} eq "failed";
-                                        print "processed $processed_items, failed $failed_items\n";
+#                                        print "Data send: processed $processed_items, failed $failed_items\n";
                                         $item_sent_counter += $total_items;
                                     });
                                 });
                         });  
                 });
-               
-               
-               
-               
-               
-               
-#               $sender->() if $#queue > 3000;
- 
+                
                 my $t;$t = AE::timer $wait,0, sub {
                         undef $t;
                         $sender->();
                 };
         }, sub { 5 })
-};$sender->() for 1..3;
+};$sender->() for 1..$num_history_sender_threads;
+#};$sender->();
 weaken($sender);    
+
+
+sub zabbix_sender{
+  my ($zabbix_srv_ip, $zabbix_srv_port, $data_pack) = @_;
+
+    my $json = JSON->new();           
+    #Prepare data for sending to zabbix server
+    my $data = {
+    'request' => 'sender data',
+    'data'    => \@$data_pack,
+    'clock'   => time
+    };
+    my $json_data = $json->encode($data);
+   
+    # Get length of data in bytes
+    use bytes;
+    my $length = length($json_data);
+    no bytes;
+    tcp_connect($zabbix_srv_ip, $zabbix_srv_port ,sub {
+        my ($fh) = @_
+        or do {
+            print "unable connect to stat host: $!\n";
+            return $sender->();
+    #                        die "unable to connect: $!";
+                };
     
+        my $handle;
+        $handle = new AnyEvent::Handle
+            fh     => $fh,
+            on_error => sub {
+            AE::log error => $_[2];
+            $_[0]->destroy;
+        },
+        on_eof => sub {
+            $handle->destroy; # destroy handle
+            AE::log info => "Done.";
+        };
+        my $out_data = pack(
+            "a4 b Q a*",
+            "ZBXD", 0x01, $length, $json_data
+        );
+    
+        $handle->push_write ($out_data);
+       
+        $handle->push_read (chunk => 5,  sub {
+                my ($response,$d)=unpack ("A4C",$_[1]);
+                print "Warn.... Invalid response from Stat Server: \"$response\"\n" if $response ne "ZBXD";
+               
+                $handle->on_read (sub {
+                        # Get length of answer data    
+                        shift->unshift_read (chunk => 8, sub {
+                            my $len = unpack "Q", $_[1];
+                            #print "Length is: $len - unpacked, ".$_[1]."-packed\n";
+                           
+                            # Get answer data
+                            shift->unshift_read (chunk => $len, sub {
+                                my $json = decode_json($_[1]);
+                                my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
+                                print "Warn.... Sending failed\n" if $json->{response} eq "failed";
+                                print "Stat send: processed $processed_items, failed $failed_items\n";
+                            });
+                        });
+                });  
+        });
+    
+    }, sub { 5 });
+}    
     
     
     

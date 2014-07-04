@@ -1,3 +1,4 @@
+use Getopt::Long;
 use AnyEvent;
 use AnyEvent::DBI::MySQL;
 use AnyEvent::Socket;
@@ -9,28 +10,53 @@ use AnyEvent::Run;
 use AnyEvent::Monitor::CPU qw( monitor_cpu );
 
 my (@queue,$item_sent_counter,$proxy_id,%timetable,%globalmacro,%hostmacro);
-my $proxy_name           = '';
-my $database             = 'zabbix';
-my $dbhostname           = '';
-my $dbport               = '3306';
-my $dbuser               = 'zabbix';
-my $dbpassword           = '';
-my $zserverhost          = "";
-my $zserverport          = '10051';
-my $stat_server_host     = '';
-my $stat_server_port     = '10052';
-my $stat_server_stathost = '';
-my $work_with_server     = 1;
-my $delay_multiplyer     = 0.05;   # Multiplyer value for item delay
-my $limit_rows_from_db   = 5000;   # Limit of rows for a query
-my $max_send_pack_size   = 1000;  # Max values send in one network session
-my $timerange            = 60;    # Period for spreading values in first timetable generation
-my $async_mysql_queries  = 1;     # Enable asynq queries in mysql (doesn't work in windows)
-my $num_concurent_mysql_threads = 3; # Number of concurent mysql threads
-my $num_history_sender_threads = 20; # Number of concurent histry sender threads
-my $start_sending_delay  = 180; # Delay for starting send data
-
+my $tester_identifier    = 'tester1';          # Identifier for separate statistics on multiple script instances
+my $proxy_name           = 'test-proxy';       # Zabbix proxy name for get and send data
+my $database             = 'zabbix';           # SQL Database name
+my $dbhostname           = '10.1.1.11';        # SQL Database host
+my $dbport               = '3306';             # SQL Database port
+my $dbuser               = 'zabbix';           # SQL Database user
+my $dbpassword           = 'SecretPW';         # SQL Database password
+my $zserverhost          = '10.1.1.1';         # Target Zabbix server/proxy address
+my $zserverport          = '10051';            # Target Zabbix server/proxy port
+my $stat_server_host     = '10.1.1.5';         # Statiscics Zabbix server/proxy address
+my $stat_server_port     = '10051';            # Statiscics  Zabbix server/proxy port
+my $stat_server_stathost = 'test1-stats';      # Host name for stat send
+my $work_with_server     = 1;                  # 1 - Work with zabbix server database; 2 - Work with zabbix proxy database
+my $delay_multiplyer     = 0.05;               # Multiplyer value for item delay
+my $limit_rows_from_db   = 50000;              # Limit of rows for a query
+my $max_send_pack_size   = 1000;               # Max values send in one network session
+my $timerange            = 60;                 # Period for spreading values in first timetable generation
+my $async_mysql_queries  = 1;                  # Enable asynq queries in mysql (doesn't work in windows)
+my $num_concurent_mysql_threads = 3;           # Number of concurent mysql threads
+my $num_history_sender_threads = 20;           # Number of concurent histry sender threads
+my $start_sending_delay  = 30;                 # Delay for starting send data
+my $max_memory_limit     = 300000;             # Memory limit for die
+my $max_queue_size       = 1000000;            # Max queue size to start throttling
+my $throttling_enabled   = 1;                  # Disable genarate data for sending if memory limit reached
+my $throttling_on        = 0;                  # Enable throttling mode
+my $throttled_values     = 0;                  # Counter for skipped values by throttling
 my $monitor = monitor_cpu cb => sub {}, interval => 1;
+
+GetOptions (
+            'tester_identifier=s' => \$tester_identifier,
+            'zserverhost=s' => \$zserverhost,
+            'zserverport=s' => \$zserverport,
+            'proxy_name=s' => \$proxy_name,
+            'database=s' => \$database,
+            'dbhostname=s' => \$dbhostname,
+            'dbport=s' => \$dbport,
+            'dbuser=s' => \$dbuser,
+            'dbpassword=s' => \$dbpassword,
+            'stat_server_port=s' => \$stat_server_port,
+            'stat_server_stathost=s' => \$stat_server_stathost,
+            'work_with_server=s' => \$work_with_server,
+            'delay_multiplyer=s' => \$delay_multiplyer,
+            'max_send_pack_size=s' => \$max_send_pack_size,
+            'max_memory_limit=s' => \$max_memory_limit,
+            'max_queue_size=s' => \$max_queue_size,
+            'num_history_sender_threads=s' => \$num_history_sender_threads,
+            );
 
 my $cv = AnyEvent->condvar;
 my $dbh = AnyEvent::DBI::MySQL->connect("DBI:mysql:database=$database;host=$dbhostname;
@@ -96,6 +122,7 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
     our $limit_iterator = 0;
     my $loop;$loop = sub {
         if ($limit_iterator > int($hash_ref->{COUNT} / $limit_rows_from_db)) {
+            $dbh->disconnect();
             return;
         }
 
@@ -178,22 +205,35 @@ $dbh->selectrow_hashref($sel_countq,{async => $async_mysql_queries},sub {
             $loop->();
 	});
 
-        print "Filling timetable done\n"; 
+        print "Filling timetable done\n";
+        
 #    };$loop->() for 1 .. $num_concurent_mysql_threads;
     };$loop->();
     weaken($loop);
 });
 
-# Timer for check timetable jobs and generate item values
+
+# Timer for check timetable jobs and run item generator
 my $value_generator = AnyEvent->timer(
     after => 0,
     interval => 1,
     cb => sub {
         my $ctime = time();
+        generate_values($ctime);
         
-        if (exists $timetable{$ctime}) {
-            print scalar @{$timetable{$ctime}}." values exists on ",$ctime,"\n";
-            foreach my $kk (@{$timetable{$ctime}}){
+        # Run jobs for old timestamps
+        map{ generate_values($_) if $_< $ctime }(keys %timetable);
+    });
+
+# Item generator soubroutine
+sub generate_values($){
+    my $ctime = shift;    
+    if (exists $timetable{$ctime}) {
+        print scalar @{$timetable{$ctime}}." values exists on ",$ctime,"\n";
+        foreach my $kk (@{$timetable{$ctime}}){
+            
+            # Skip generate data and push to queue
+            if (!$throttling_on){
                 my $val = 0;
                 
                 if ($kk->{value_type}==0) {
@@ -229,120 +269,24 @@ my $value_generator = AnyEvent->timer(
                 
                 # Add item to send queue
                 push @queue,{host=>$kk->{hosthost},key=>$kk->{key},clock=>$clock,ns=>$ns,value=>$val};
-#                print "queue length ".scalar @queue."\n";
-                
-                # Change delay 0 to 60 on trapper items
-                $kk->{delay} = 60 if $kk->{delay}==0;
-                
-                # Readd item to timetable
-                push @{$timetable{$ctime+int($kk->{delay}*$delay_multiplyer)}},$kk;
+                # print "queue length ".scalar @queue."\n";
+            
+            }
+            else{
+                $throttled_values++;
             }
             
-            # Remove current timetable jobs
-            delete $timetable{$ctime};
+            # Change delay 0 to 60 on trapper items
+            $kk->{delay} = 60 if $kk->{delay}==0;
+            
+            # Readd item to timetable
+            push @{$timetable{$ctime+int($kk->{delay}*$delay_multiplyer)}},$kk;
         }
-    });
-
-# Timer for send items from send queue to zabbix server
-#my $value_sender = AnyEvent->timer(
-#    after    => 5,
-#    interval => 2,
-#    cb       => sub {
-#        my $pack_size = 0;
-#        my @pack = ();
-#        
-#        # Walk for queue
-#        while (@queue) {
-#            #Check if pack size less than maximum defined size
-#            last if ++$pack_size > $max_send_pack_size;
-#            my $item = shift @queue;
-#            
-#            # Add item to send pack
-#            push @pack,$item;
-#        }
-#        my $json = JSON->new();
-#        
-#        #Prepare data for sending to zabbix server
-#        my $data = {
-#        'request' => 'history data',
-#        'host'    => 'test-proxy',
-#        'data'    => \@pack,
-#        'clock'   => time
-#        };
-#        my $json_data = $json->encode($data);
-# 
-#        # Get length of data in bytes
-#        use bytes;
-#        my $length = length($json_data);
-#        no bytes;
-#        #my $out_data = pack(
-#        #    "a4 b c4 c4 a*",
-#        #    "ZBXD", 0x01,
-#        #    ( $length & 0xFF ),
-#        #    ( $length & 0x00FF ) >> 8,
-#        #    ( $length & 0x0000FF ) >> 16,
-#        #    ( $length & 0x000000FF ) >> 24,
-#        #    0x00, 0x00, 0x00, 0x00, $json_data
-#        #);
-#        
-#        # Pack data into zabbix protocol
-#        my $out_data = pack(
-#            "a4 b Q a*",
-#            "ZBXD", 0x01, $length, $json_data
-#        );
-#        
-#        # Create connection to zabbix server
-#        tcp_connect $zserverhost, $zserverport,
-#        sub {
-#            my ($fh) = @_
-#                or die "unable to connect: $!";
-#  
-#            my $handle; 
-#            $handle = new AnyEvent::Handle
-#                fh     => $fh,
-#                on_error => sub {
-#                AE::log error => $_[2];
-#                $_[0]->destroy;
-#            },
-#            on_eof => sub {
-#                $handle->destroy; # destroy handle
-#                AE::log info => "Done.";
-#            };
-#            
-#            # Send data to server
-#            $handle->push_write ($out_data);
-#            
-#            # Read answer (first 5 bytes for check ZBXD header)
-#            $handle->push_read (chunk => 5,  sub {
-#                my ($response,$d)=unpack ("A4C",$_[1]);
-#                print "Warn.... Invalid response from Server: \"$response\"\n" if $response ne "ZBXD";
-#                
-#                $handle->on_read (sub {
-#                # Get length of answer data    
-#                shift->unshift_read (chunk => 8, sub {
-#                    my $len = unpack "Q", $_[1];
-#                    #print "Length is: $len - unpacked, ".$_[1]."-packed\n";
-#                    
-#                    # Get answer data
-#                    shift->unshift_read (chunk => $len, sub {
-#                        my $json = decode_json($_[1]);
-#                        my ($processed_items,$failed_items,$total_items,$time_spent) = $json->{info}=~/^Processed\s+(\d+)\s+Failed\s+(\d+)\s+Total\s+(\d+)\s+Seconds\s+spent\s+([\d\.]+)$/;
-#                        print "Warn.... Sending failed\n" if $json->{response} eq "failed";
-#                        print "processed $processed_items, failed $failed_items\n";
-#                        $item_sent_counter += $total_items;
-#                    });
-#                });
-#              });  
-#           });
-#           
-#        }, sub {
-#            my ($fh) = @_;
-#            # could call $fh->bind etc. here
-#            #setsockopt($fh, SOL_SOCKET, SO_REUSEADDR, 1)  or die $!;
-#            
-#            15  #set timeout
-#        };
-#    });   
+        
+        # Remove current timetable jobs
+        delete $timetable{$ctime};
+    }
+}
 
 # Timer for calculate statistic    
 my $stat_processing = AnyEvent->timer (
@@ -367,19 +311,43 @@ my $stat_processing = AnyEvent->timer (
             # Split stat for values (man 5 proc for value sequence)
             my @proc_stat = split /\s+/,$line;
             
-            
+            my $oldvalues=0;
+            my $ctime = time();
+            map{ $oldvalues++ if $_< $ctime }(keys %timetable);
             my $stats = $monitor->stats;
+            
+            # Die if script use over 500 MB memory
+            die("Memory MAX usage reached") if $proc_stat[0] > $max_memory_limit;
+            
+            # Enable throttling if queue size is over max defined value
+            if (scalar @queue > $max_queue_size) {
+                if ($throttling_enabled) {
+                    $throttling_on=1;
+                }
+            }
+            
+            # disable throttling if queeue not max
+            if ($throttling_on && (scalar @queue < ($max_queue_size * 0.2))) {
+                $throttling_on = 0;
+            }
+            
+            
             print "Processed $item_sent_counter in 1 minute, average speed ".($item_sent_counter/60)." values per second\n";
-            print "Current send queue size ".($#queue+1).", CPU usage $stats->{usage}, VmSize $proc_stat[0], VmRSS $proc_stat[1]\n";
+            print "Current send queue size ".($#queue+1).", JOBS: total - ".(scalar keys %timetable).
+                ", skipped - $oldvalues, CPU usage $stats->{usage}, VmSize $proc_stat[0], VmRSS $proc_stat[1]\n";
+            print "Throttled values: $throttled_values, throttling status $throttling_on\n";
             my @stat_data = (
-                            {host => $stat_server_stathost, key => 'tester1.queue.size',     value => ($#queue+1)},
-                            {host => $stat_server_stathost, key => 'tester1.values.sent',    value => ($item_sent_counter/60)},
-                            {host => $stat_server_stathost, key => 'tester1.cpu.usage',      value => $stats->{usage}},
-                            {host => $stat_server_stathost, key => 'tester1.cpu.avg_usage',  value => ($stats->{usage_avg})},
-                            {host => $stat_server_stathost, key => 'tester1.stat.vsize',     value => $proc_stat[0]},
-                            {host => $stat_server_stathost, key => 'tester1.stat.rss',       value => $proc_stat[1]},    
-                            {host => $stat_server_stathost, key => 'tester1.stat.shared',    value => $proc_stat[2]},
-                            {host => $stat_server_stathost, key => 'tester1.stat.datastack', value => $proc_stat[5]}, 
+                            {host => $stat_server_stathost, key => $tester_identifier.'.queue.size',      value => ($#queue+1)},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.values.sent',     value => ($item_sent_counter/60)},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.cpu.usage',       value => $stats->{usage}},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.cpu.avg_usage',   value => ($stats->{usage_avg})},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.stat.vsize',      value => $proc_stat[0]},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.stat.rss',        value => $proc_stat[1]},    
+                            {host => $stat_server_stathost, key => $tester_identifier.'.stat.shared',     value => $proc_stat[2]},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.stat.datastack',  value => $proc_stat[5]},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.jobs.skipped',    value => $oldvalues},
+                            {host => $stat_server_stathost, key => $tester_identifier.'.values.throttled',value => $throttled_values},
+                            
                             
                             );
             zabbix_sender($stat_server_host,$stat_server_port,\@stat_data);
@@ -411,9 +379,13 @@ my $sender;$sender = sub {
                     AE::log error => $_[2];
                     $_[0]->destroy;
                 },
+                on_error => sub {
+                    $handle->destroy; # destroy handle
+#                    AE::log info => "Connection error.";
+                },
                 on_eof => sub {
                     $handle->destroy; # destroy handle
-                    AE::log info => "Done.";
+#                    AE::log info => "Connection Done.";
                 };
                 my $pack_size = 0;
                 my @pack = ();
@@ -525,7 +497,11 @@ sub zabbix_sender{
         },
         on_eof => sub {
             $handle->destroy; # destroy handle
-            AE::log info => "Done.";
+#            AE::log info => "Done.";
+        },
+        on_error => sub {
+            $handle->destroy; # destroy handle
+#            AE::log info => "Error.";
         };
         my $out_data = pack(
             "a4 b Q a*",

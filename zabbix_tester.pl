@@ -49,6 +49,7 @@ GetOptions (
             'dbuser=s' => \$dbuser,
             'dbpassword=s' => \$dbpassword,
             'stat_server_port=s' => \$stat_server_port,
+            'stat_server_host=s' => \$stat_server_host,
             'stat_server_stathost=s' => \$stat_server_stathost,
             'work_with_server=s' => \$work_with_server,
             'delay_multiplyer=s' => \$delay_multiplyer,
@@ -454,13 +455,18 @@ my $sender;$sender = sub {
                         });  
                 });
                 
-                my $t;$t = AE::timer $wait,0, sub {
-                        undef $t;
-                        $sender->();
-                };
+		# Wait if queue emty or send restart sendin immediatly
+		if (scalar @queue){
+                    my $t;$t = AE::timer $wait,0, sub {
+                            undef $t;
+                            $sender->();
+                    };
+                }
+                else {
+		    $sender->();
+		}
         }, sub { 5 })
 };$sender->() for 1..$num_history_sender_threads;
-#};$sender->();
 weaken($sender);    
 
 

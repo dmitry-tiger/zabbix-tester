@@ -456,7 +456,7 @@ my $sender;$sender = sub {
                 });
                 
 		# Wait if queue emty or send restart sendin immediatly
-		if (scalar @queue){
+		if ( ! scalar @queue){
                     my $t;$t = AE::timer $wait,0, sub {
                             undef $t;
                             $sender->();
